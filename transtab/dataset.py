@@ -193,11 +193,19 @@ def load_single_data(dataname, dataset_config=None, encode_cat=False, data_cut=N
     # start processing features
     # process num
     if len(num_cols) > 0:
-        for col in num_cols: X[col].fillna(X[col].mode()[0], inplace=True)
+        for col in num_cols: 
+            m = X[col].mode(dropna=True)
+            fill_value = m.iloc[0] if len(m) > 0 else 0
+            X.loc[:, col] = X[col].fillna(fill_value)
+            # X[col].fillna(fill_value, inplace=True)
         X[num_cols] = MinMaxScaler().fit_transform(X[num_cols])
 
     if len(cat_cols) > 0:
-        for col in cat_cols: X[col].fillna(X[col].mode()[0], inplace=True)
+        for col in cat_cols: 
+            m = X[col].mode(dropna=True)
+            fill_value = m.iloc[0] if len(m) > 0 else ""
+            X.loc[:, col] = X[col].fillna(fill_value)
+            # X[col].fillna(fill_value, inplace=True)
         # process cate
         if encode_cat:
             X[cat_cols] = OrdinalEncoder().fit_transform(X[cat_cols])
@@ -205,8 +213,12 @@ def load_single_data(dataname, dataset_config=None, encode_cat=False, data_cut=N
             X[cat_cols] = X[cat_cols].astype(str)
 
     if len(bin_cols) > 0:
-        for col in bin_cols: X[col].fillna(X[col].mode()[0], inplace=True)
-        if 'binary_indicator' in dataset_config:
+        for col in bin_cols: 
+            m = X[col].mode(dropna=True)
+            fill_value = m.iloc[0] if len(m) > 0 else 0
+            X.loc[:, col] = X[col].fillna(fill_value)
+            # X[col].fillna(fill_value, inplace=True)
+        if dataset_config is not None and 'binary_indicator' in dataset_config:
             X[bin_cols] = X[bin_cols].astype(str).applymap(lambda x: 1 if x.lower() in dataset_config['binary_indicator'] else 0).values
         else:
             X[bin_cols] = X[bin_cols].astype(str).applymap(lambda x: 1 if x.lower() in ['yes','true','1','t'] else 0).values        

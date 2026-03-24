@@ -343,6 +343,8 @@ def build_contrastive_learner(
     device='cuda:0',
     checkpoint=None,
     ignore_duplicate_cols=True,
+    temperature=10.0,
+    base_temperature=10.0,
     **kwargs,
     ): 
     '''Build a contrastive learner for pretraining based on TransTab.
@@ -435,6 +437,9 @@ def build_contrastive_learner(
         overlap_ratio=overlap_ratio,
         activation=activation,
         device=device,
+        temperature=temperature,
+        base_temperature=base_temperature,
+        **kwargs
     )
     if checkpoint is not None:
         model.load(checkpoint)
