@@ -4,11 +4,13 @@ import os
 from transtab import constants
 from transtab.modeling_transtab import TransTabClassifier, TransTabRegressor, TransTabFeatureExtractor, TransTabFeatureProcessor
 from transtab.modeling_transtab import TransTabForCL
+from transtab.modeling_transtab import TransTabForSupConBCE
 from transtab.modeling_transtab import TransTabInputEncoder, TransTabModel
 from transtab.dataset import load_data
 from transtab.evaluator import predict, evaluate
 from transtab.trainer import Trainer
 from transtab.trainer_utils import TransTabCollatorForCL
+from transtab.trainer_utils import TransTabCollatorForSupConBCE
 from transtab.trainer_utils import random_seed
 
 def build_classifier(
@@ -452,6 +454,79 @@ def build_contrastive_learner(
         overlap_ratio=overlap_ratio,
         num_partition=num_partition,
         ignore_duplicate_cols=ignore_duplicate_cols
+    )
+    if checkpoint is not None:
+        collate_fn.feature_extractor.load(os.path.join(checkpoint, constants.EXTRACTOR_STATE_DIR))
+
+    return model, collate_fn
+
+
+def build_supcon_bce_learner(
+    categorical_columns=None,
+    numerical_columns=None,
+    binary_columns=None,
+    projection_dim=128,
+    num_partition=3,
+    overlap_ratio=0.5,
+    hidden_dim=128,
+    num_layer=2,
+    num_attention_head=8,
+    hidden_dropout_prob=0,
+    ffn_dim=256,
+    activation='relu',
+    device='cuda:0',
+    checkpoint=None,
+    ignore_duplicate_cols=True,
+    temperature=10.0,
+    base_temperature=10.0,
+    supcon_weight=1.0,
+    bce_weight=1.0,
+    **kwargs,
+    ):
+    '''Build a supervised contrastive + BCE binary learner based on TransTab.
+
+    This is the builder for `TransTabForSupConBCE`, analogous to `build_contrastive_learner`.
+    It returns a model plus a collator that provides both:
+    - multi-view/partitioned inputs (`input_sub_x`) for SupCon
+    - full-table inputs (`input_full`) for BCE
+
+    Returns
+    -------
+    model: TransTabForSupConBCE
+    collate_fn: TransTabCollatorForSupConBCE
+    '''
+
+    model = TransTabForSupConBCE(
+        categorical_columns=categorical_columns,
+        numerical_columns=numerical_columns,
+        binary_columns=binary_columns,
+        num_partition=num_partition,
+        hidden_dim=hidden_dim,
+        num_layer=num_layer,
+        num_attention_head=num_attention_head,
+        hidden_dropout_prob=hidden_dropout_prob,
+        ffn_dim=ffn_dim,
+        projection_dim=projection_dim,
+        overlap_ratio=overlap_ratio,
+        activation=activation,
+        device=device,
+        temperature=temperature,
+        base_temperature=base_temperature,
+        supcon_weight=supcon_weight,
+        bce_weight=bce_weight,
+        **kwargs,
+    )
+
+    if checkpoint is not None:
+        model.load(checkpoint)
+
+    collate_fn = TransTabCollatorForSupConBCE(
+        categorical_columns=categorical_columns,
+        numerical_columns=numerical_columns,
+        binary_columns=binary_columns,
+        overlap_ratio=overlap_ratio,
+        num_partition=num_partition,
+        ignore_duplicate_cols=ignore_duplicate_cols,
     )
     if checkpoint is not None:
         collate_fn.feature_extractor.load(os.path.join(checkpoint, constants.EXTRACTOR_STATE_DIR))

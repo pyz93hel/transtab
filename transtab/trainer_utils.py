@@ -157,6 +157,42 @@ class TransTabCollatorForCL(TrainCollator):
         sub_x_list.append(pd.concat([x.copy().drop(corrupt_cols,axis=1), x_corrupt], axis=1))
         return sub_x_list
 
+
+class TransTabCollatorForSupConBCE(TransTabCollatorForCL):
+    '''Collator for `TransTabForSupConBCE`.
+
+    Extends `TransTabCollatorForCL` by also returning a full-table tokenization
+    under key `input_full` for the BCE branch.
+
+    Returns
+    -------
+    inputs: dict
+        {
+            'input_sub_x': list[dict],
+            'input_full': dict
+        }
+    y: pd.Series
+        The original labels.
+    '''
+
+    def __call__(self, data):
+        df_x = pd.concat([row[0] for row in data])
+        df_y = pd.concat([row[1] for row in data])
+
+        if self.num_partition > 1:
+            sub_x_list = self._build_positive_pairs(df_x, self.num_partition)
+        else:
+            sub_x_list = self._build_positive_pairs_single_view(df_x)
+
+        input_x_list = []
+        for sub_x in sub_x_list:
+            inputs = self.feature_extractor(sub_x)
+            input_x_list.append(inputs)
+
+        input_full = self.feature_extractor(df_x)
+        res = {'input_sub_x': input_x_list, 'input_full': input_full}
+        return res, df_y
+
 def get_parameter_names(model, forbidden_layer_types):
     """
     Returns the names of the model parameters that are not inside a forbidden layer.

@@ -1440,3 +1440,240 @@ class TransTabForCL(TransTabModel):
         loss = - (self.temperature / self.base_temperature) * mean_log_prob_pos
         loss = loss.view(anchor_count, batch_size).mean()
         return loss
+
+class TransTabForSupConBCE(TransTabModel):
+    '''Hybrid model: Supervised Contrastive (SupCon/VPCL) + BCE binary classification.
+
+    This combines the multi-view (partition) supervised contrastive objective from `TransTabForCL`
+    with a standard binary classifier head (BCEWithLogitsLoss) like `TransTabClassifier`.
+
+    Notes
+    -----
+    - Contrastive branch uses *partitioned views* (vertical partitions) of the same sample.
+    - Classification branch uses the *full table* representation (single forward).
+    - If labels are strings, they are converted to 0/1 via categorical codes (stable per batch).
+    '''
+
+    def __init__(self,
+        categorical_columns=None,
+        numerical_columns=None,
+        binary_columns=None,
+        feature_extractor=None,
+        hidden_dim=128,
+        num_layer=2,
+        num_attention_head=8,
+        hidden_dropout_prob=0,
+        ffn_dim=256,
+        projection_dim=128,
+        overlap_ratio=0.1,
+        num_partition=2,
+        temperature=10,
+        base_temperature=10,
+        supcon_weight: float = 1.0,
+        bce_weight: float = 1.0,
+        activation='relu',
+        device='cuda:0',
+        **kwargs,
+        ) -> None:
+        super().__init__(
+            categorical_columns=categorical_columns,
+            numerical_columns=numerical_columns,
+            binary_columns=binary_columns,
+            feature_extractor=feature_extractor,
+            hidden_dim=hidden_dim,
+            num_layer=num_layer,
+            num_attention_head=num_attention_head,
+            hidden_dropout_prob=hidden_dropout_prob,
+            ffn_dim=ffn_dim,
+            activation=activation,
+            device=device,
+            **kwargs,
+        )
+
+        assert num_partition > 0, f'num_partition must be > 0, got {num_partition}'
+        assert isinstance(num_partition, int), f'num_partition must be int, got {type(num_partition)}'
+        assert 0 <= overlap_ratio < 1, f'overlap_ratio must be in [0, 1), got {overlap_ratio}'
+        assert supcon_weight >= 0, f'supcon_weight must be >= 0, got {supcon_weight}'
+        assert bce_weight >= 0, f'bce_weight must be >= 0, got {bce_weight}'
+
+        # Contrastive head
+        self.projection_head = TransTabProjectionHead(hidden_dim, projection_dim)
+        self.temperature = temperature
+        self.base_temperature = base_temperature
+        self.num_partition = num_partition
+        self.overlap_ratio = overlap_ratio
+
+        # Classification head (binary -> 1 logit)
+        self.num_class = 2
+        self.clf = TransTabLinearClassifier(num_class=2, hidden_dim=hidden_dim)
+        self.bce_loss_fn = nn.BCEWithLogitsLoss(reduction='none')
+
+        # Loss weights
+        self.supcon_weight = supcon_weight
+        self.bce_weight = bce_weight
+
+        self.device = device
+        self.to(device)
+
+    def forward(self, x, y=None):
+        '''Forward pass.
+
+        Parameters
+        ----------
+        x: pd.DataFrame or dict
+            - pd.DataFrame: raw batch.
+            - dict: pretokenized inputs. Must contain:
+                - 'input_sub_x': list[dict] (each dict is like extractor output for one partition)
+              Optionally can contain:
+                - 'input_full': dict (extractor output for the full table) for BCE branch.
+
+        y: pd.Series or array-like or torch.Tensor
+            Binary labels. If strings/objects are provided, they are mapped to {0,1} via categorical codes.
+
+        Returns
+        -------
+        logits: torch.Tensor
+            Shape (bs, 1). The binary classification logits from the full-table branch.
+
+        loss: torch.Tensor or None
+            Combined loss = supcon_weight * supcon + bce_weight * bce (if y is provided), else None.
+        '''
+        # ---- 1) Build multi-view features for supervised contrastive loss ----
+        feat_x_list = []
+        if isinstance(x, pd.DataFrame):
+            sub_x_list = self._build_positive_pairs(x, self.num_partition)
+            for sub_x in sub_x_list:
+                feat_x = self.input_encoder(sub_x)
+                feat_x = self.cls_token(**feat_x)
+                feat_x = self.encoder(**feat_x)
+                feat_x_proj = self.projection_head(feat_x[:, 0, :])  # (bs, proj_dim)
+                feat_x_list.append(feat_x_proj)
+        elif isinstance(x, dict):
+            if 'input_sub_x' not in x:
+                raise ValueError("When passing dict input, expected key 'input_sub_x' (list of partition inputs).")
+            for input_x in x['input_sub_x']:
+                feat_x = self.input_encoder.feature_processor(**input_x)
+                feat_x = self.cls_token(**feat_x)
+                feat_x = self.encoder(**feat_x)
+                feat_x_proj = self.projection_head(feat_x[:, 0, :])
+                feat_x_list.append(feat_x_proj)
+        else:
+            raise ValueError(f'expect input x to be pd.DataFrame or dict(pretokenized), got {type(x)} instead')
+
+        feat_x_multiview = torch.stack(feat_x_list, dim=1)  # (bs, n_view, proj_dim)
+
+        # ---- 2) Full-table encoding for BCE classifier branch ----
+        if isinstance(x, pd.DataFrame):
+            inputs_full = self.input_encoder.feature_extractor(x)
+            outputs_full = self.input_encoder.feature_processor(**inputs_full)
+        else:
+            # dict input path
+            if 'input_full' in x and x['input_full'] is not None:
+                outputs_full = self.input_encoder.feature_processor(**x['input_full'])
+            elif len(x.get('input_sub_x', [])) == 1:
+                # fallback: only one view provided -> treat it as "full" for BCE
+                outputs_full = self.input_encoder.feature_processor(**x['input_sub_x'][0])
+            else:
+                raise ValueError(
+                    "Dict input must provide 'input_full' for BCE branch (or only one partition in 'input_sub_x')."
+                )
+
+        outputs_full = self.cls_token(**outputs_full)
+        encoder_output_full = self.encoder(**outputs_full)  # (bs, seq_len+1, hidden_dim)
+        logits = self.clf(encoder_output_full)  # (bs, 1)
+
+        if y is None:
+            return logits, None
+
+        # ---- 3) Prepare labels (supports string/object labels) ----
+        y_ts = self._to_binary_label_tensor(y, device=feat_x_multiview.device)  # (bs,)
+
+        # ---- 4) Losses ----
+        supcon = self.supervised_contrastive_loss(feat_x_multiview, y_ts)
+        bce = self.bce_loss_fn(logits.flatten(), y_ts.float()).mean()
+
+        loss = self.supcon_weight * supcon + self.bce_weight * bce
+        return logits, loss
+
+    def _to_binary_label_tensor(self, y, device):
+        # Accept pd.Series / np.array / list / torch.Tensor
+        if isinstance(y, torch.Tensor):
+            y_ts = y.detach()
+        else:
+            if isinstance(y, pd.Series):
+                y_arr = y.values
+            else:
+                y_arr = np.asarray(y)
+
+            # If labels are strings/objects/bools, map to {0,1} using categorical codes
+            if y_arr.dtype == object or y_arr.dtype.kind in {'U', 'S'}:
+                codes = pd.Categorical(y_arr).codes
+                y_ts = torch.tensor(codes, device=device)
+            elif y_arr.dtype == bool:
+                y_ts = torch.tensor(y_arr.astype(np.int64), device=device)
+            else:
+                y_ts = torch.tensor(y_arr, device=device)
+
+        y_ts = y_ts.view(-1)
+
+        # Ensure exactly two classes if possible (helps catch mistakes early)
+        uniq = torch.unique(y_ts)
+        if uniq.numel() > 2:
+            raise ValueError(f'Expected binary labels, but got {uniq.numel()} unique labels: {uniq.tolist()}')
+        return y_ts.long()
+
+    def _build_positive_pairs(self, x, n):
+        x_cols = x.columns.tolist()
+        sub_col_list = np.array_split(np.array(x_cols), n)
+        len_cols = len(sub_col_list[0])
+        overlap = int(np.ceil(len_cols * (self.overlap_ratio)))
+        sub_x_list = []
+        for i, sub_col in enumerate(sub_col_list):
+            if overlap > 0 and i < n - 1:
+                sub_col = np.concatenate([sub_col, sub_col_list[i + 1][:overlap]])
+            elif overlap > 0 and i == n - 1:
+                sub_col = np.concatenate([sub_col, sub_col_list[i - 1][-overlap:]])
+            sub_x = x.copy()[sub_col]
+            sub_x_list.append(sub_x)
+        return sub_x_list
+
+    def supervised_contrastive_loss(self, features, labels):
+        """Supervised contrastive loss (SupCon) over multi-view features.
+
+        features: (bs, n_view, proj_dim)
+        labels:   (bs,)
+        """
+        labels = labels.contiguous().view(-1, 1)
+        batch_size = features.shape[0]
+        mask = torch.eq(labels, labels.T).float().to(labels.device)  # (bs, bs)
+
+        contrast_count = features.shape[1]
+        contrast_feature = torch.cat(torch.unbind(features, dim=1), dim=0)  # (bs*n_view, proj_dim)
+
+        anchor_feature = contrast_feature
+        anchor_count = contrast_count
+
+        anchor_dot_contrast = torch.div(torch.matmul(anchor_feature, contrast_feature.T), self.temperature)
+        logits_max, _ = torch.max(anchor_dot_contrast, dim=1, keepdim=True)
+        logits = anchor_dot_contrast - logits_max.detach()
+
+        mask = mask.repeat(anchor_count, contrast_count)  # (bs*n_view, bs*n_view)
+
+        logits_mask = torch.scatter(
+            torch.ones_like(mask),
+            1,
+            torch.arange(batch_size * anchor_count, device=features.device).view(-1, 1),
+            0,
+        )
+        mask = mask * logits_mask
+
+        exp_logits = torch.exp(logits) * logits_mask
+        log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True) + 1e-12)
+
+        # Avoid division-by-zero if an anchor has no positives in-batch
+        pos_cnt = mask.sum(1).clamp_min(1.0)
+        mean_log_prob_pos = (mask * log_prob).sum(1) / pos_cnt
+
+        loss = - (self.temperature / self.base_temperature) * mean_log_prob_pos
+        loss = loss.view(anchor_count, batch_size).mean()
+        return loss
