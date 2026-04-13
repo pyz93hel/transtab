@@ -112,6 +112,7 @@ class Trainer:
             train_loss_all = 0
             for dataindex in range(len(self.trainloader_list)):
                 for data in self.trainloader_list[dataindex]:
+                    self.model.train()
                     self.optimizer.zero_grad()
                     logits, loss = self.model(data[0], data[1])
                     loss.backward()
@@ -190,10 +191,10 @@ class Trainer:
 
         for epoch in range(args['num_epoch']):
             ite = 0
+            train_loss_all = 0
             # go through all train sets
             for train_set in self.train_set_list:
                 x_train, y_train = train_set
-                train_loss_all = 0
                 for i in range(0, len(x_train), args['batch_size']):
                     self.model.train()
                     if self.balance_sample:
@@ -217,12 +218,14 @@ class Trainer:
                     if self.lr_scheduler is not None:
                         self.lr_scheduler.step()
 
-            if self.test_set is not None:
+            if self.test_set_list is not None:
                 # evaluate in each epoch
-                self.model.eval()
-                x_test, y_test = self.test_set
-                pred_all = predict(self.model, x_test, self.args['eval_batch_size'])
-                eval_res = self.args['eval_metric'](y_test, pred_all)
+                eval_res_list = []
+                for x_test, y_test in self.test_set_list:
+                    self.model.eval()
+                    pred_all = predict(self.model, x_test, self.args['eval_batch_size'])
+                    eval_res_list.append(self.args['eval_metric'](y_test, pred_all))
+                eval_res = np.mean(eval_res_list)
                 print('epoch: {}, test {}: {}'.format(epoch, self.args['eval_metric_name'], eval_res))
                 self.early_stopping(-eval_res, self.model)
                 if self.early_stopping.early_stop:
@@ -232,7 +235,7 @@ class Trainer:
             print('epoch: {}, train loss: {}, lr: {:.6f}'.format(epoch, train_loss_all, self.optimizer.param_groups[0]['lr']))
 
         if os.path.exists(self.output_dir):
-            if self.test_set is not None:
+            if self.test_set_list is not None:
                 # load checkpoints
                 print('load best at last from', self.output_dir)
                 state_dict = torch.load(os.path.join(self.output_dir, constants.WEIGHTS_NAME), map_location='cpu')
