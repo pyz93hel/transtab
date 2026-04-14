@@ -1471,6 +1471,11 @@ class TransTabForSupConBCE(TransTabModel):
         base_temperature=10,
         supcon_weight: float = 1.0,
         bce_weight: float = 1.0,
+        use_focal_bce: bool = True,
+        focal_gamma: float = 2.0,
+        focal_alpha: Optional[float] = 0.25,
+        use_class_balanced_supcon: bool = True,
+        supcon_class_balance_beta: float = 0.999,
         activation='relu',
         device='cuda:0',
         **kwargs,
@@ -1495,6 +1500,11 @@ class TransTabForSupConBCE(TransTabModel):
         assert 0 <= overlap_ratio < 1, f'overlap_ratio must be in [0, 1), got {overlap_ratio}'
         assert supcon_weight >= 0, f'supcon_weight must be >= 0, got {supcon_weight}'
         assert bce_weight >= 0, f'bce_weight must be >= 0, got {bce_weight}'
+        assert isinstance(use_focal_bce, bool), f'use_focal_bce must be bool, got {type(use_focal_bce)}'
+        assert focal_gamma >= 0, f'focal_gamma must be >= 0, got {focal_gamma}'
+        assert focal_alpha is None or (0 <= focal_alpha <= 1), f'focal_alpha must be None or in [0,1], got {focal_alpha}'
+        assert isinstance(use_class_balanced_supcon, bool), f'use_class_balanced_supcon must be bool, got {type(use_class_balanced_supcon)}'
+        assert 0 <= supcon_class_balance_beta < 1, f'supcon_class_balance_beta must be in [0,1), got {supcon_class_balance_beta}'
 
         # Contrastive head
         self.projection_head = TransTabProjectionHead(hidden_dim, projection_dim)
@@ -1511,6 +1521,11 @@ class TransTabForSupConBCE(TransTabModel):
         # Loss weights
         self.supcon_weight = supcon_weight
         self.bce_weight = bce_weight
+        self.use_focal_bce = use_focal_bce
+        self.focal_gamma = focal_gamma
+        self.focal_alpha = focal_alpha
+        self.use_class_balanced_supcon = use_class_balanced_supcon
+        self.supcon_class_balance_beta = supcon_class_balance_beta
 
         self.device = device
         self.to(device)
@@ -1590,7 +1605,19 @@ class TransTabForSupConBCE(TransTabModel):
 
         # ---- 4) Losses ----
         supcon = self.supervised_contrastive_loss(feat_x_multiview, y_ts)
-        bce = self.bce_loss_fn(logits.flatten(), y_ts.float()).mean()
+        logits_flat = logits.flatten()
+        y_float = y_ts.float()
+        bce_raw = self.bce_loss_fn(logits_flat, y_float)
+        if self.use_focal_bce:
+            p = torch.sigmoid(logits_flat)
+            pt = torch.where(y_float == 1, p, 1 - p)
+            focal_weight = (1 - pt).pow(self.focal_gamma)
+            if self.focal_alpha is not None:
+                alpha_t = torch.where(y_float == 1, self.focal_alpha, 1 - self.focal_alpha)
+                focal_weight = focal_weight * alpha_t
+            bce = (focal_weight * bce_raw).mean()
+        else:
+            bce = bce_raw.mean()
 
         loss = self.supcon_weight * supcon + self.bce_weight * bce
         return logits, loss
@@ -1643,9 +1670,9 @@ class TransTabForSupConBCE(TransTabModel):
         features: (bs, n_view, proj_dim)
         labels:   (bs,)
         """
-        labels = labels.contiguous().view(-1, 1)
+        labels = labels.contiguous().view(-1)
         batch_size = features.shape[0]
-        mask = torch.eq(labels, labels.T).float().to(labels.device)  # (bs, bs)
+        mask = torch.eq(labels.view(-1, 1), labels.view(1, -1)).float().to(labels.device)  # (bs, bs)
 
         contrast_count = features.shape[1]
         contrast_feature = torch.cat(torch.unbind(features, dim=1), dim=0)  # (bs*n_view, proj_dim)
@@ -1675,5 +1702,19 @@ class TransTabForSupConBCE(TransTabModel):
         mean_log_prob_pos = (mask * log_prob).sum(1) / pos_cnt
 
         loss = - (self.temperature / self.base_temperature) * mean_log_prob_pos
-        loss = loss.view(anchor_count, batch_size).mean()
+        if self.use_class_balanced_supcon:
+            # Class-balanced anchor weighting to reduce dominance of majority class.
+            anchor_weights = self._class_balanced_sample_weights(labels, self.supcon_class_balance_beta)
+            anchor_weights = anchor_weights.repeat(anchor_count).to(features.device)
+            loss = (loss * anchor_weights).sum() / anchor_weights.sum().clamp_min(1e-12)
+        else:
+            loss = loss.mean()
         return loss
+
+    def _class_balanced_sample_weights(self, labels, beta=0.999):
+        # Effective-number class balancing from Cui et al. (CVPR 2019).
+        class_counts = torch.bincount(labels, minlength=2).float().to(labels.device)
+        effective_num = 1.0 - torch.pow(torch.tensor(beta, device=labels.device), class_counts)
+        class_weights = (1.0 - beta) / effective_num.clamp_min(1e-12)
+        class_weights = class_weights / class_weights.mean().clamp_min(1e-12)
+        return class_weights[labels]
