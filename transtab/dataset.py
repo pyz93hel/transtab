@@ -219,9 +219,14 @@ def load_single_data(dataname, dataset_config=None, encode_cat=False, data_cut=N
             X.loc[:, col] = X[col].fillna(fill_value)
             # X[col].fillna(fill_value, inplace=True)
         if dataset_config is not None and 'binary_indicator' in dataset_config:
-            X[bin_cols] = X[bin_cols].astype(str).applymap(lambda x: 1 if x.lower() in dataset_config['binary_indicator'] else 0).values
+            bin_indicator = [str(v).lower() for v in dataset_config['binary_indicator']]
         else:
-            X[bin_cols] = X[bin_cols].astype(str).applymap(lambda x: 1 if x.lower() in ['yes','true','1','t'] else 0).values        
+            bin_indicator = ['yes','true','1','t']
+        # NOTE: DataFrame.applymap was deprecated in pandas 2.1 and removed in pandas 3.0.
+        # Use a column-wise str.lower().isin(...) comparison instead, which works on all versions.
+        X[bin_cols] = X[bin_cols].astype(str).apply(
+            lambda col: col.str.lower().isin(bin_indicator).astype(int)
+        ).values
         
         # if no dataset_config given, keep its original format
         # raise warning if there is not only 0/1 in the binary columns
