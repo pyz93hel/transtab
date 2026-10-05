@@ -178,7 +178,11 @@ class TransTabFeatureExtractor:
 
         if len(bin_cols) > 0:
             x_bin = x[bin_cols] # x_bin should already be integral (binary values in 0 & 1)
-            x_bin_str = x_bin.apply(lambda x: x.name + ' ') * x_bin
+            # Build the "colname " tokens directly. The previous code did
+            # `x_bin.apply(lambda x: x.name + ' ') * x_bin`, relying on Python's
+            # `str.__mul__`; NumPy>=2 routes that through numpy.strings.multiply
+            # and raises "The 'out' kwarg is necessary" for string arrays.
+            x_bin_str = x_bin.apply(lambda col: np.where(col == 1, col.name + ' ', ''))
             x_bin_str = x_bin_str.agg(' '.join, axis=1).values.tolist()
             x_bin_ts = self.tokenizer(x_bin_str, padding=True, truncation=True, add_special_tokens=False, return_tensors='pt')
             if x_bin_ts['input_ids'].shape[1] > 0: # not all false
