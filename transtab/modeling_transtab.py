@@ -159,7 +159,9 @@ class TransTabFeatureExtractor:
         if len(num_cols) > 0:
             x_num = x[num_cols]
             x_num = x_num.fillna(0) # fill Nan with zero
-            x_num_ts = torch.tensor(x_num.values, dtype=float)
+            # `.values` can be a non-contiguous view with negative strides after
+            # upstream concat/column reordering; torch.tensor rejects those.
+            x_num_ts = torch.tensor(np.ascontiguousarray(x_num.values), dtype=float)
             num_col_ts = self.tokenizer(num_cols, padding=True, truncation=True, add_special_tokens=False, return_tensors='pt')
             encoded_inputs['x_num'] = x_num_ts
             encoded_inputs['num_col_input_ids'] = num_col_ts['input_ids']
@@ -1017,10 +1019,10 @@ class TransTabClassifier(TransTabModel):
         if y is not None:
             # compute classification loss
             if self.num_class == 2:
-                y_ts = torch.tensor(y.values).to(self.device).float()
+                y_ts = torch.tensor(np.ascontiguousarray(y.values)).to(self.device).float()
                 loss = self.loss_fn(logits.flatten(), y_ts)
             else:
-                y_ts = torch.tensor(y.values).to(self.device).long()
+                y_ts = torch.tensor(np.ascontiguousarray(y.values)).to(self.device).long()
                 loss = self.loss_fn(logits, y_ts)
             loss = loss.mean()
         else:
@@ -1150,7 +1152,7 @@ class TransTabRegressor(TransTabModel):
 
         if y is not None:
             # compute regression loss
-            y_ts = torch.tensor(y.values).to(self.device).float()
+            y_ts = torch.tensor(np.ascontiguousarray(y.values)).to(self.device).float()
             loss = self.loss_fn(output.flatten(), y_ts)
             loss = loss.mean()
         else:
@@ -1315,7 +1317,7 @@ class TransTabForCL(TransTabModel):
 
         if y is not None and self.supervised:
             # take supervised loss
-            y = torch.tensor(y.values, device=feat_x_multiview.device)
+            y = torch.tensor(np.ascontiguousarray(y.values), device=feat_x_multiview.device)
             loss = self.supervised_contrastive_loss(feat_x_multiview, y)
         else:
             # compute cl loss (multi-view InfoNCE loss)
